@@ -10,6 +10,9 @@ import os from "os";
 const app = express();
 const PORT = process.env.PORT || 4000;
 
+// Trust Railway / reverse proxy so req.protocol is https
+app.set("trust proxy", 1);
+
 const TEMP_DIR = process.env.TEMP_DIR || path.join(os.tmpdir(), "vidora");
 const MAX_DURATION_MIN = 30;
 
@@ -17,7 +20,6 @@ if (!fs.existsSync(TEMP_DIR)) {
   fs.mkdirSync(TEMP_DIR, { recursive: true });
 }
 
-// Allow all origins so the Vercel frontend can call this API
 app.use(
   cors({
     origin: true,
@@ -104,6 +106,12 @@ function formatDuration(seconds: number): string {
   const s = Math.floor(seconds % 60);
   if (h > 0) return `${h}:${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
   return `${m}:${s.toString().padStart(2, "0")}`;
+}
+
+function publicBaseUrl(req: express.Request): string {
+  const proto = (req.get("x-forwarded-proto") || req.protocol || "https").split(",")[0].trim();
+  const host = (req.get("x-forwarded-host") || req.get("host") || "localhost").split(",")[0].trim();
+  return `${proto}://${host}`;
 }
 
 app.get("/health", (_req, res) => {
@@ -297,7 +305,7 @@ app.get("/api/job/:id", (req, res) => {
     progress: job.progress,
     message: job.message,
     downloadUrl: job.downloadUrl
-      ? `${req.protocol}://${req.get("host")}${job.downloadUrl}`
+      ? `${publicBaseUrl(req)}${job.downloadUrl}`
       : undefined,
     filename: job.filename,
     error: job.error,
@@ -316,6 +324,7 @@ app.get("/api/file/:id", (req, res) => {
   const filename = job.filename || "download";
   res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
   res.setHeader("Content-Type", "application/octet-stream");
+  res.setHeader("Access-Control-Expose-Headers", "Content-Disposition");
 
   const stream = fs.createReadStream(job.filePath);
   stream.pipe(res);
