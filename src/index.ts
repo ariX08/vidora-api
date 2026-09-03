@@ -86,7 +86,10 @@ const downloadSchema = urlSchema.extend({
   quality: z.string().default("best"),
 });
 
-function runYtDlp(args: string[]): Promise<{ stdout: string; stderr: string }> {
+function runYtDlp(
+  args: string[],
+  timeoutMs = 5 * 60 * 1000
+): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     const proc = spawn("yt-dlp", args, {
       stdio: ["ignore", "pipe", "pipe"],
@@ -101,12 +104,21 @@ function runYtDlp(args: string[]): Promise<{ stdout: string; stderr: string }> {
     const timeout = setTimeout(() => {
       proc.kill("SIGKILL");
       reject(new Error("yt-dlp timed out"));
-    }, 5 * 60 * 1000);
+    }, timeoutMs);
 
     proc.on("close", (code) => {
       clearTimeout(timeout);
       if (code === 0) resolve({ stdout, stderr });
-      else reject(new Error(stderr || `yt-dlp exited with code ${code}`));
+      else {
+        const errText = (stderr || stdout || "").trim();
+        // Pick the most useful ERROR line
+        const lines = errText.split("\n").filter(Boolean);
+        const errorLine =
+          lines.find((l) => /ERROR:/i.test(l)) ||
+          lines.slice(-3).join(" ") ||
+          `yt-dlp exited with code ${code}`;
+        reject(new Error(errorLine.slice(0, 400)));
+      }
     });
 
     proc.on("error", (err) => {
@@ -161,7 +173,6 @@ function contentTypeForExt(ext: string): string {
   return map[ext.toLowerCase()] || "application/octet-stream";
 }
 
-/** Reliable yt-dlp format strings */
 function videoFormatSelector(quality: string): string {
   const heightMap: Record<string, number> = {
     "1080p": 1080,
@@ -171,13 +182,21 @@ function videoFormatSelector(quality: string): string {
   };
 
   if (quality === "best" || !heightMap[quality]) {
-    // Highest quality available that can merge into mp4
     return "bestvideo*+bestaudio/best";
   }
 
   const h = heightMap[quality];
   return `bestvideo[height<=${h}]+bestaudio/best[height<=${h}]/best`;
 }
+
+const YT_COMMON_ARGS = [
+  "--no-playlist",
+  "--no-warnings",
+  "--force-ipv4",
+  // Multiple clients improves success rate (web-only often fails)
+  "--extractor-args",
+  "youtube:player_client=android,web,ios,tv",
+];
 
 app.get("/health", (_req, res) => {
   res.json({ status: "ok", service: "vidora-backend" });
@@ -189,11 +208,7 @@ app.post("/api/info", async (req, res) => {
 
     const { stdout } = await runYtDlp([
       "--dump-json",
-      "--no-playlist",
-      "--no-warnings",
-      "--extractor-args",
-      "youtube:player_client=web,android,tv",
-      "--force-ipv4",
+      ...YT_COMMON_ARGS,
       url,
     ]);
 
@@ -230,10 +245,10 @@ app.post("/api/info", async (req, res) => {
     console.error("info error:", e.message);
     const msg = String(e.message || "");
     res.status(400).json({
-      error: msg.includes("unavailable")
+      error: /unavailable|private|not available/i.test(msg)
         ? "This video is unavailable or private."
-        : msg.includes("yt-dlp") || msg.includes("ERROR")
-          ? "Could not fetch video info. Try another URL."
+        : /ERROR:|yt-dlp/i.test(msg)
+          ? msg.replace(/^ERROR:\s*/i, "").slice(0, 200)
           : e.message || "Invalid request",
     });
   }
@@ -266,11 +281,7 @@ app.post("/api/download", async (req, res) => {
           const { stdout: titleOut } = await runYtDlp([
             "--print",
             "%(title)s",
-            "--no-playlist",
-            "--no-warnings",
-            "--extractor-args",
-            "youtube:player_client=web,android,tv",
-            "--force-ipv4",
+            ...YT_COMMON_ARGS,
             url,
           ]);
           const t = titleOut.trim().split("\n")[0];
@@ -279,74 +290,132 @@ app.post("/api/download", async (req, res) => {
           // keep fallback
         }
 
-        const args: string[] = [
-          "--no-playlist",
-          "--no-warnings",
+        const baseArgs: string[] = [
+          ...YT_COMMON_ARGS,
           "-o",
           outTemplate,
           "--newline",
           "--progress",
-          "--extractor-args",
-          "youtube:player_client=web,android,tv",
-          "--force-ipv4",
         ];
 
+        // Build candidate arg lists: primary format, then simpler fallbacks
+        const attempts: string[][] = [];
+
         if (type === "audio") {
-          args.push("-x", "--audio-format", "mp3");
-          if (quality === "320k") args.push("--audio-quality", "0");
-          else if (quality === "192k") args.push("--audio-quality", "2");
-          else args.push("--audio-quality", "5");
+          const audioQ =
+            quality === "320k" ? "0" : quality === "192k" ? "2" : "5";
+          attempts.push([
+            ...baseArgs,
+            "-x",
+            "--audio-format",
+            "mp3",
+            "--audio-quality",
+            audioQ,
+            url,
+          ]);
         } else {
-          args.push("--merge-output-format", "mp4");
-          args.push("-f", videoFormatSelector(quality));
+          const fmt = videoFormatSelector(quality);
+          // Primary
+          attempts.push([
+            ...baseArgs,
+            "--merge-output-format",
+            "mp4",
+            "-f",
+            fmt,
+            url,
+          ]);
+          // Fallback: no height filter
+          attempts.push([
+            ...baseArgs,
+            "--merge-output-format",
+            "mp4",
+            "-f",
+            "bestvideo*+bestaudio/best",
+            url,
+          ]);
+          // Last resort: single progressive stream
+          attempts.push([...baseArgs, "-f", "best", url]);
         }
 
-        args.push(url);
+        let lastErr: Error | null = null;
 
-        console.log("yt-dlp args:", args.join(" "));
+        for (let i = 0; i < attempts.length; i++) {
+          const args = attempts[i];
+          console.log(`yt-dlp attempt ${i + 1}:`, args.join(" "));
+          job.message =
+            i === 0 ? "Downloading..." : `Retrying (attempt ${i + 1})...`;
 
-        await new Promise<void>((resolve, reject) => {
-          const proc = spawn("yt-dlp", args, {
-            stdio: ["ignore", "pipe", "pipe"],
-          });
+          try {
+            await new Promise<void>((resolve, reject) => {
+              const proc = spawn("yt-dlp", args, {
+                stdio: ["ignore", "pipe", "pipe"],
+              });
 
-          let lastProgress = 10;
+              let lastProgress = 10;
+              let stderr = "";
 
-          const onData = (d: Buffer) => {
-            const line = d.toString();
-            const match = line.match(/(\d+\.?\d*)%/);
-            if (match) {
-              const p = Math.min(
-                90,
-                Math.round(parseFloat(match[1]) * 0.8) + 10
-              );
-              if (p > lastProgress) {
-                lastProgress = p;
-                job.progress = p;
-                job.message = `Downloading... ${Math.round(parseFloat(match[1]))}%`;
+              const onData = (d: Buffer) => {
+                const line = d.toString();
+                stderr += line;
+                const match = line.match(/(\d+\.?\d*)%/);
+                if (match) {
+                  const p = Math.min(
+                    90,
+                    Math.round(parseFloat(match[1]) * 0.8) + 10
+                  );
+                  if (p > lastProgress) {
+                    lastProgress = p;
+                    job.progress = p;
+                    job.message = `Downloading... ${Math.round(parseFloat(match[1]))}%`;
+                  }
+                }
+              };
+
+              proc.stdout.on("data", onData);
+              proc.stderr.on("data", onData);
+
+              const timeout = setTimeout(() => {
+                proc.kill("SIGKILL");
+                reject(new Error("Download timed out"));
+              }, 8 * 60 * 1000);
+
+              proc.on("close", (code) => {
+                clearTimeout(timeout);
+                if (code === 0) resolve();
+                else {
+                  const lines = stderr.split("\n").filter(Boolean);
+                  const errorLine =
+                    lines.find((l) => /ERROR:/i.test(l)) ||
+                    lines.slice(-2).join(" ") ||
+                    `yt-dlp failed with code ${code}`;
+                  reject(new Error(errorLine.slice(0, 400)));
+                }
+              });
+
+              proc.on("error", (err) => {
+                clearTimeout(timeout);
+                reject(err);
+              });
+            });
+
+            // Success — stop trying fallbacks
+            lastErr = null;
+            break;
+          } catch (err: any) {
+            lastErr = err;
+            console.error(`attempt ${i + 1} failed:`, err.message);
+            // Clean partial files before next attempt
+            try {
+              for (const f of fs.readdirSync(TEMP_DIR)) {
+                if (f.startsWith(jobId)) {
+                  fs.unlinkSync(path.join(TEMP_DIR, f));
+                }
               }
-            }
-          };
+            } catch {}
+          }
+        }
 
-          proc.stdout.on("data", onData);
-          proc.stderr.on("data", onData);
-
-          const timeout = setTimeout(() => {
-            proc.kill("SIGKILL");
-            reject(new Error("Download timed out"));
-          }, 8 * 60 * 1000);
-
-          proc.on("close", (code) => {
-            clearTimeout(timeout);
-            if (code === 0) resolve();
-            else reject(new Error(`yt-dlp failed with code ${code}`));
-          });
-
-          proc.on("error", (err) => {
-            clearTimeout(timeout);
-            reject(err);
-          });
-        });
+        if (lastErr) throw lastErr;
 
         const files = fs
           .readdirSync(TEMP_DIR)
@@ -375,7 +444,16 @@ app.post("/api/download", async (req, res) => {
         }
       } catch (e: any) {
         job.status = "failed";
-        job.error = e.message || "Processing failed";
+        const raw = String(e.message || "Processing failed");
+        // Friendlier messages
+        let friendly = raw.replace(/^ERROR:\s*/i, "");
+        if (/unavailable|private/i.test(friendly))
+          friendly = "This video is unavailable or private.";
+        else if (/Sign in|login required/i.test(friendly))
+          friendly = "This video requires sign-in and cannot be downloaded.";
+        else if (/age/i.test(friendly))
+          friendly = "Age-restricted videos are not supported.";
+        job.error = friendly.slice(0, 250);
         job.message = job.error;
         console.error("download job error:", e);
       }
