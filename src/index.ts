@@ -14,6 +14,7 @@ app.set("trust proxy", 1);
 
 const TEMP_DIR = process.env.TEMP_DIR || path.join(os.tmpdir(), "vidora");
 const MAX_DURATION_MIN = 30;
+const COOKIES_FILE = process.env.YTDLP_COOKIES_FILE || "";
 
 if (!fs.existsSync(TEMP_DIR)) {
   fs.mkdirSync(TEMP_DIR, { recursive: true });
@@ -85,6 +86,22 @@ const downloadSchema = urlSchema.extend({
   type: z.enum(["video", "audio"]).default("video"),
   quality: z.string().default("best"),
 });
+
+/** Shared yt-dlp flags that reduce bot challenges on cloud IPs */
+function baseYtArgs(): string[] {
+  const args = [
+    "--no-playlist",
+    "--no-warnings",
+    "--force-ipv4",
+    // Android client usually avoids "Sign in to confirm you're not a bot"
+    "--extractor-args",
+    "youtube:player_client=android,ios,tv,web",
+  ];
+  if (COOKIES_FILE && fs.existsSync(COOKIES_FILE)) {
+    args.push("--cookies", COOKIES_FILE);
+  }
+  return args;
+}
 
 function runYtDlp(args: string[]): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
@@ -169,6 +186,16 @@ function contentTypeForExt(ext: string): string {
   return map[ext.toLowerCase()] || "application/octet-stream";
 }
 
+function friendlyError(raw: string): string {
+  let msg = raw.replace(/^ERROR:\s*/i, "");
+  if (/Sign in to confirm|not a bot|cookies/i.test(msg))
+    return "YouTube blocked this request (bot check). Try another video or try again later.";
+  if (/unavailable|private/i.test(msg))
+    return "This video is unavailable or private.";
+  if (/age/i.test(msg)) return "Age-restricted videos are not supported.";
+  return msg.slice(0, 250);
+}
+
 app.get("/health", (_req, res) => {
   res.json({ status: "ok", service: "vidora-backend" });
 });
@@ -179,9 +206,7 @@ app.post("/api/info", async (req, res) => {
 
     const { stdout } = await runYtDlp([
       "--dump-json",
-      "--no-playlist",
-      "--no-warnings",
-      "--force-ipv4",
+      ...baseYtArgs(),
       url,
     ]);
 
@@ -216,11 +241,8 @@ app.post("/api/info", async (req, res) => {
     });
   } catch (e: any) {
     console.error("info error:", e.message);
-    const msg = String(e.message || "");
     res.status(400).json({
-      error: /unavailable|private|not available/i.test(msg)
-        ? "This video is unavailable or private."
-        : e.message || "Invalid request",
+      error: friendlyError(String(e.message || "Invalid request")),
     });
   }
 });
@@ -252,9 +274,7 @@ app.post("/api/download", async (req, res) => {
           const { stdout: titleOut } = await runYtDlp([
             "--print",
             "%(title)s",
-            "--no-playlist",
-            "--no-warnings",
-            "--force-ipv4",
+            ...baseYtArgs(),
             url,
           ]);
           const t = titleOut.trim().split("\n")[0];
@@ -263,11 +283,8 @@ app.post("/api/download", async (req, res) => {
           // keep fallback
         }
 
-        // Simple reliable args (what was working before)
         const args: string[] = [
-          "--no-playlist",
-          "--no-warnings",
-          "--force-ipv4",
+          ...baseYtArgs(),
           "-o",
           outTemplate,
           "--newline",
@@ -280,7 +297,6 @@ app.post("/api/download", async (req, res) => {
           else if (quality === "192k") args.push("--audio-quality", "2");
           else args.push("--audio-quality", "5");
         } else {
-          // Simple: let yt-dlp pick a good stream and merge to mp4
           args.push("--merge-output-format", "mp4", "-f", "bv*+ba/b");
         }
 
@@ -367,11 +383,7 @@ app.post("/api/download", async (req, res) => {
         }
       } catch (e: any) {
         job.status = "failed";
-        const raw = String(e.message || "Processing failed");
-        let friendly = raw.replace(/^ERROR:\s*/i, "");
-        if (/unavailable|private/i.test(friendly))
-          friendly = "This video is unavailable or private.";
-        job.error = friendly.slice(0, 250);
+        job.error = friendlyError(String(e.message || "Processing failed"));
         job.message = job.error;
         console.error("download job error:", e);
       }
@@ -425,4 +437,5 @@ app.get("/api/file/:id", (req, res) => {
 app.listen(PORT, () => {
   console.log(`Vidora backend listening on :${PORT}`);
   console.log(`Temp dir: ${TEMP_DIR}`);
+  if (COOKIES_FILE) console.log(`Cookies file: ${COOKIES_FILE}`);
 });
