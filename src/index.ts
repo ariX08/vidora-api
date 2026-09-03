@@ -58,27 +58,33 @@ setInterval(() => {
   }
 }, 10 * 60 * 1000);
 
-function normalizeYouTubeUrl(raw: string): string {
+function normalizeMediaUrl(raw: string): string {
   let u = String(raw || "").trim().replace(/^["']|["']$/g, "");
   if (!u) return u;
   if (/^https?:\/\//i.test(u)) return u;
-  if (/^(www\.)?(youtube\.com|youtu\.be)\//i.test(u)) return `https://${u}`;
+  if (/^(www\.)?(youtube\.com|youtu\.be|instagram\.com)\//i.test(u))
+    return `https://${u}`;
   return u;
+}
+
+function isSupportedUrl(u: string): boolean {
+  return /youtube\.com|youtu\.be|instagram\.com/i.test(u);
+}
+
+function isYouTube(u: string): boolean {
+  return /youtube\.com|youtu\.be/i.test(u);
 }
 
 const urlSchema = z.object({
   url: z
     .string()
     .min(1)
-    .transform(normalizeYouTubeUrl)
+    .transform(normalizeMediaUrl)
     .pipe(
       z
         .string()
         .url()
-        .refine(
-          (u) => /youtube\.com|youtu\.be/i.test(u),
-          "Only YouTube URLs are supported"
-        )
+        .refine(isSupportedUrl, "Only YouTube and Instagram URLs are supported")
     ),
 });
 
@@ -87,16 +93,17 @@ const downloadSchema = urlSchema.extend({
   quality: z.string().default("best"),
 });
 
-/** Shared yt-dlp flags that reduce bot challenges on cloud IPs */
-function baseYtArgs(): string[] {
-  const args = [
-    "--no-playlist",
-    "--no-warnings",
-    "--force-ipv4",
-    // Android client usually avoids "Sign in to confirm you're not a bot"
-    "--extractor-args",
-    "youtube:player_client=android,ios,tv,web",
-  ];
+function baseYtArgs(url: string): string[] {
+  const args = ["--no-playlist", "--no-warnings", "--force-ipv4"];
+
+  // YouTube-only client args (helps avoid bot checks)
+  if (isYouTube(url)) {
+    args.push(
+      "--extractor-args",
+      "youtube:player_client=android,ios,tv,web"
+    );
+  }
+
   if (COOKIES_FILE && fs.existsSync(COOKIES_FILE)) {
     args.push("--cookies", COOKIES_FILE);
   }
@@ -189,9 +196,11 @@ function contentTypeForExt(ext: string): string {
 function friendlyError(raw: string): string {
   let msg = raw.replace(/^ERROR:\s*/i, "");
   if (/Sign in to confirm|not a bot|cookies/i.test(msg))
-    return "YouTube blocked this request (bot check). Try another video or try again later.";
-  if (/unavailable|private/i.test(msg))
-    return "This video is unavailable or private.";
+    return "Platform blocked this request (bot/login check). Try another link or try again later.";
+  if (/login required|rate-limit|Please wait/i.test(msg))
+    return "Instagram requires login for this content. Public reels work best.";
+  if (/unavailable|private|not available/i.test(msg))
+    return "This media is unavailable or private.";
   if (/age/i.test(msg)) return "Age-restricted videos are not supported.";
   return msg.slice(0, 250);
 }
@@ -206,7 +215,7 @@ app.post("/api/info", async (req, res) => {
 
     const { stdout } = await runYtDlp([
       "--dump-json",
-      ...baseYtArgs(),
+      ...baseYtArgs(url),
       url,
     ]);
 
@@ -219,14 +228,15 @@ app.post("/api/info", async (req, res) => {
     }
 
     res.json({
-      title: meta.title || "Untitled",
+      title: meta.title || meta.fulltitle || "Untitled",
       thumbnail:
         meta.thumbnail ||
         (meta.thumbnails && meta.thumbnails[meta.thumbnails.length - 1]?.url) ||
         "",
       duration: meta.duration ? formatDuration(meta.duration) : "-",
-      uploader: meta.uploader || meta.channel || "Unknown",
+      uploader: meta.uploader || meta.channel || meta.creator || "Unknown",
       videoId: meta.id,
+      platform: isYouTube(url) ? "youtube" : "instagram",
       formats: (meta.formats || [])
         .filter(
           (f: any) => f.ext && (f.vcodec !== "none" || f.acodec !== "none")
@@ -274,7 +284,7 @@ app.post("/api/download", async (req, res) => {
           const { stdout: titleOut } = await runYtDlp([
             "--print",
             "%(title)s",
-            ...baseYtArgs(),
+            ...baseYtArgs(url),
             url,
           ]);
           const t = titleOut.trim().split("\n")[0];
@@ -284,7 +294,7 @@ app.post("/api/download", async (req, res) => {
         }
 
         const args: string[] = [
-          ...baseYtArgs(),
+          ...baseYtArgs(url),
           "-o",
           outTemplate,
           "--newline",
@@ -297,7 +307,12 @@ app.post("/api/download", async (req, res) => {
           else if (quality === "192k") args.push("--audio-quality", "2");
           else args.push("--audio-quality", "5");
         } else {
-          args.push("--merge-output-format", "mp4", "-f", "bv*+ba/b");
+          // Instagram often has a single progressive stream; YouTube uses merge
+          if (isYouTube(url)) {
+            args.push("--merge-output-format", "mp4", "-f", "bv*+ba/b");
+          } else {
+            args.push("-f", "best");
+          }
         }
 
         args.push(url);
