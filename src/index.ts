@@ -10,7 +10,6 @@ import os from "os";
 const app = express();
 const PORT = process.env.PORT || 4000;
 
-// Trust Railway / reverse proxy so req.protocol is https
 app.set("trust proxy", 1);
 
 const TEMP_DIR = process.env.TEMP_DIR || path.join(os.tmpdir(), "vidora");
@@ -114,6 +113,33 @@ function publicBaseUrl(req: express.Request): string {
   return `${proto}://${host}`;
 }
 
+/** Make a safe filesystem / Content-Disposition filename from a YouTube title */
+function sanitizeFilename(title: string, maxLen = 80): string {
+  let name = title
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "") // strip diacritics
+    .replace(/[^\w\s\-\u00C0-\u024F.()\[\]]+/g, "") // keep letters, numbers, spaces, basic punctuation
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!name) name = "vidora-download";
+  if (name.length > maxLen) name = name.slice(0, maxLen).trim();
+  return name;
+}
+
+function contentTypeForExt(ext: string): string {
+  const map: Record<string, string> = {
+    mp4: "video/mp4",
+    webm: "video/webm",
+    mkv: "video/x-matroska",
+    mp3: "audio/mpeg",
+    m4a: "audio/mp4",
+    opus: "audio/opus",
+    wav: "audio/wav",
+  };
+  return map[ext.toLowerCase()] || "application/octet-stream";
+}
+
 app.get("/health", (_req, res) => {
   res.json({ status: "ok", service: "vidora-backend" });
 });
@@ -176,6 +202,7 @@ app.post("/api/download", async (req, res) => {
   try {
     const { url, type, quality } = downloadSchema.parse(req.body);
     const jobId = uuidv4();
+    // Unique temp name so we can find the file; title is applied after download
     const outTemplate = path.join(TEMP_DIR, `${jobId}.%(ext)s`);
 
     jobs.set(jobId, {
@@ -194,6 +221,25 @@ app.post("/api/download", async (req, res) => {
       job.progress = 10;
 
       try {
+        // 1) Get title first so we can name the file properly
+        let videoTitle = "vidora-download";
+        try {
+          const { stdout: titleOut } = await runYtDlp([
+            "--print",
+            "%(title)s",
+            "--no-playlist",
+            "--no-warnings",
+            "--extractor-args",
+            "youtube:player_client=web,android,tv",
+            "--force-ipv4",
+            url,
+          ]);
+          const t = titleOut.trim().split("\n")[0];
+          if (t) videoTitle = t;
+        } catch {
+          // keep fallback title
+        }
+
         const args: string[] = [
           "--no-playlist",
           "--no-warnings",
@@ -271,7 +317,10 @@ app.post("/api/download", async (req, res) => {
         if (files.length === 0) throw new Error("Output file not found");
 
         const filePath = path.join(TEMP_DIR, files[0]);
-        const filename = files[0].replace(jobId + ".", "vidora-");
+        const ext = path.extname(files[0]).replace(".", "") || (type === "audio" ? "mp3" : "mp4");
+        const safeTitle = sanitizeFilename(videoTitle);
+        const filename = `${safeTitle}.${ext}`;
+
         const stats = fs.statSync(filePath);
 
         job.status = "completed";
@@ -321,9 +370,18 @@ app.get("/api/file/:id", (req, res) => {
     return res.status(404).json({ error: "File expired" });
   }
 
-  const filename = job.filename || "download";
-  res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
-  res.setHeader("Content-Type", "application/octet-stream");
+  const filename = job.filename || "vidora-download.mp4";
+  const ext = path.extname(filename).replace(".", "") || "mp4";
+
+  // RFC 5987 for unicode titles in Content-Disposition
+  const asciiFallback = filename.replace(/[^\x20-\x7E]/g, "_");
+  const encoded = encodeURIComponent(filename).replace(/['()]/g, escape);
+
+  res.setHeader(
+    "Content-Disposition",
+    `attachment; filename="${asciiFallback}"; filename*=UTF-8''${encoded}`
+  );
+  res.setHeader("Content-Type", contentTypeForExt(ext));
   res.setHeader("Access-Control-Expose-Headers", "Content-Disposition");
 
   const stream = fs.createReadStream(job.filePath);
