@@ -13,17 +13,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Copy package files first for better layer caching
 COPY package.json ./
-
-# Install ALL dependencies (including TypeScript for the build)
 RUN npm install
 
-# Copy source code
 COPY . .
-
-# Compile TypeScript → JavaScript
-RUN npx tsc
 
 ENV NODE_ENV=production
 ENV PORT=4000
@@ -31,5 +24,5 @@ ENV TEMP_DIR=/tmp/vidora
 
 EXPOSE 4000
 
-# Start the compiled app
-CMD ["node", "dist/index.js"]
+# Run TypeScript directly with tsx (no separate build step)
+CMD ["npx", "tsx", "src/index.ts"]
