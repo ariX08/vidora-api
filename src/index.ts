@@ -113,12 +113,11 @@ function publicBaseUrl(req: express.Request): string {
   return `${proto}://${host}`;
 }
 
-/** Make a safe filesystem / Content-Disposition filename from a YouTube title */
 function sanitizeFilename(title: string, maxLen = 80): string {
   let name = title
     .normalize("NFKD")
-    .replace(/[\u0300-\u036f]/g, "") // strip diacritics
-    .replace(/[^\w\s\-\u00C0-\u024F.()\[\]]+/g, "") // keep letters, numbers, spaces, basic punctuation
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^\w\s\-\u00C0-\u024F.()\[\]]+/g, "")
     .replace(/\s+/g, " ")
     .trim();
 
@@ -138,6 +137,32 @@ function contentTypeForExt(ext: string): string {
     wav: "audio/wav",
   };
   return map[ext.toLowerCase()] || "application/octet-stream";
+}
+
+/** Build yt-dlp -f selector for the requested quality */
+function videoFormatSelector(quality: string): string {
+  // Prefer H.264 + AAC so merge produces a proper mp4 without re-encode issues
+  const heightMap: Record<string, number> = {
+    "1080p": 1080,
+    "720p": 720,
+    "480p": 480,
+    "360p": 360,
+  };
+
+  if (quality === "best" || !heightMap[quality]) {
+    // Best available, prefer mp4-friendly codecs, fall back to any
+    return "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b";
+  }
+
+  const h = heightMap[quality];
+  // Strict height cap with graceful fallbacks to lower qualities
+  return [
+    `bv*[height<=${h}][ext=mp4]+ba[ext=m4a]`,
+    `bv*[height<=${h}]+ba`,
+    `b[height<=${h}][ext=mp4]`,
+    `b[height<=${h}]`,
+    "bv*+ba/b",
+  ].join("/");
 }
 
 app.get("/health", (_req, res) => {
@@ -202,7 +227,6 @@ app.post("/api/download", async (req, res) => {
   try {
     const { url, type, quality } = downloadSchema.parse(req.body);
     const jobId = uuidv4();
-    // Unique temp name so we can find the file; title is applied after download
     const outTemplate = path.join(TEMP_DIR, `${jobId}.%(ext)s`);
 
     jobs.set(jobId, {
@@ -221,7 +245,6 @@ app.post("/api/download", async (req, res) => {
       job.progress = 10;
 
       try {
-        // 1) Get title first so we can name the file properly
         let videoTitle = "vidora-download";
         try {
           const { stdout: titleOut } = await runYtDlp([
@@ -237,7 +260,7 @@ app.post("/api/download", async (req, res) => {
           const t = titleOut.trim().split("\n")[0];
           if (t) videoTitle = t;
         } catch {
-          // keep fallback title
+          // keep fallback
         }
 
         const args: string[] = [
@@ -259,21 +282,12 @@ app.post("/api/download", async (req, res) => {
           else args.push("--audio-quality", "5");
         } else {
           args.push("--merge-output-format", "mp4");
-          if (quality === "best") {
-            args.push("-f", "bv*+ba/b", "-S", "res,vcodec:h264");
-          } else {
-            const resMap: Record<string, string> = {
-              "1080p": "1080",
-              "720p": "720",
-              "480p": "480",
-              "360p": "360",
-            };
-            const r = resMap[quality] || "720";
-            args.push("-f", "bv*+ba/b", "-S", `res:${r},vcodec:h264`);
-          }
+          args.push("-f", videoFormatSelector(quality));
         }
 
         args.push(url);
+
+        console.log("yt-dlp args:", args.join(" "));
 
         await new Promise<void>((resolve, reject) => {
           const proc = spawn("yt-dlp", args, { stdio: ["ignore", "pipe", "pipe"] });
@@ -373,7 +387,6 @@ app.get("/api/file/:id", (req, res) => {
   const filename = job.filename || "vidora-download.mp4";
   const ext = path.extname(filename).replace(".", "") || "mp4";
 
-  // RFC 5987 for unicode titles in Content-Disposition
   const asciiFallback = filename.replace(/[^\x20-\x7E]/g, "_");
   const encoded = encodeURIComponent(filename).replace(/['()]/g, escape);
 
