@@ -57,11 +57,28 @@ setInterval(() => {
   }
 }, 10 * 60 * 1000);
 
+function normalizeYouTubeUrl(raw: string): string {
+  let u = String(raw || "").trim().replace(/^["']|["']$/g, "");
+  if (!u) return u;
+  if (/^https?:\/\//i.test(u)) return u;
+  if (/^(www\.)?(youtube\.com|youtu\.be)\//i.test(u)) return `https://${u}`;
+  return u;
+}
+
 const urlSchema = z.object({
-  url: z.string().url().refine(
-    (u) => /youtube\.com|youtu\.be/i.test(u),
-    "Only YouTube URLs are supported"
-  ),
+  url: z
+    .string()
+    .min(1)
+    .transform(normalizeYouTubeUrl)
+    .pipe(
+      z
+        .string()
+        .url()
+        .refine(
+          (u) => /youtube\.com|youtu\.be/i.test(u),
+          "Only YouTube URLs are supported"
+        )
+    ),
 });
 
 const downloadSchema = urlSchema.extend({
@@ -103,13 +120,18 @@ function formatDuration(seconds: number): string {
   const h = Math.floor(seconds / 3600);
   const m = Math.floor((seconds % 3600) / 60);
   const s = Math.floor(seconds % 60);
-  if (h > 0) return `${h}:${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
+  if (h > 0)
+    return `${h}:${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
 function publicBaseUrl(req: express.Request): string {
-  const proto = (req.get("x-forwarded-proto") || req.protocol || "https").split(",")[0].trim();
-  const host = (req.get("x-forwarded-host") || req.get("host") || "localhost").split(",")[0].trim();
+  const proto = (req.get("x-forwarded-proto") || req.protocol || "https")
+    .split(",")[0]
+    .trim();
+  const host = (req.get("x-forwarded-host") || req.get("host") || "localhost")
+    .split(",")[0]
+    .trim();
   return `${proto}://${host}`;
 }
 
@@ -139,9 +161,8 @@ function contentTypeForExt(ext: string): string {
   return map[ext.toLowerCase()] || "application/octet-stream";
 }
 
-/** Build yt-dlp -f selector for the requested quality */
+/** Reliable yt-dlp format strings */
 function videoFormatSelector(quality: string): string {
-  // Prefer H.264 + AAC so merge produces a proper mp4 without re-encode issues
   const heightMap: Record<string, number> = {
     "1080p": 1080,
     "720p": 720,
@@ -150,19 +171,12 @@ function videoFormatSelector(quality: string): string {
   };
 
   if (quality === "best" || !heightMap[quality]) {
-    // Best available, prefer mp4-friendly codecs, fall back to any
-    return "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b";
+    // Highest quality available that can merge into mp4
+    return "bestvideo*+bestaudio/best";
   }
 
   const h = heightMap[quality];
-  // Strict height cap with graceful fallbacks to lower qualities
-  return [
-    `bv*[height<=${h}][ext=mp4]+ba[ext=m4a]`,
-    `bv*[height<=${h}]+ba`,
-    `b[height<=${h}][ext=mp4]`,
-    `b[height<=${h}]`,
-    "bv*+ba/b",
-  ].join("/");
+  return `bestvideo[height<=${h}]+bestaudio/best[height<=${h}]/best`;
 }
 
 app.get("/health", (_req, res) => {
@@ -197,11 +211,13 @@ app.post("/api/info", async (req, res) => {
         meta.thumbnail ||
         (meta.thumbnails && meta.thumbnails[meta.thumbnails.length - 1]?.url) ||
         "",
-      duration: meta.duration ? formatDuration(meta.duration) : "\u2014",
+      duration: meta.duration ? formatDuration(meta.duration) : "-",
       uploader: meta.uploader || meta.channel || "Unknown",
       videoId: meta.id,
       formats: (meta.formats || [])
-        .filter((f: any) => f.ext && (f.vcodec !== "none" || f.acodec !== "none"))
+        .filter(
+          (f: any) => f.ext && (f.vcodec !== "none" || f.acodec !== "none")
+        )
         .slice(0, 20)
         .map((f: any) => ({
           format_id: f.format_id,
@@ -241,7 +257,7 @@ app.post("/api/download", async (req, res) => {
     (async () => {
       const job = jobs.get(jobId)!;
       job.status = "processing";
-      job.message = "Downloading\u2026";
+      job.message = "Downloading...";
       job.progress = 10;
 
       try {
@@ -290,7 +306,9 @@ app.post("/api/download", async (req, res) => {
         console.log("yt-dlp args:", args.join(" "));
 
         await new Promise<void>((resolve, reject) => {
-          const proc = spawn("yt-dlp", args, { stdio: ["ignore", "pipe", "pipe"] });
+          const proc = spawn("yt-dlp", args, {
+            stdio: ["ignore", "pipe", "pipe"],
+          });
 
           let lastProgress = 10;
 
@@ -298,11 +316,14 @@ app.post("/api/download", async (req, res) => {
             const line = d.toString();
             const match = line.match(/(\d+\.?\d*)%/);
             if (match) {
-              const p = Math.min(90, Math.round(parseFloat(match[1]) * 0.8) + 10);
+              const p = Math.min(
+                90,
+                Math.round(parseFloat(match[1]) * 0.8) + 10
+              );
               if (p > lastProgress) {
                 lastProgress = p;
                 job.progress = p;
-                job.message = `Downloading\u2026 ${Math.round(parseFloat(match[1]))}%`;
+                job.message = `Downloading... ${Math.round(parseFloat(match[1]))}%`;
               }
             }
           };
@@ -327,11 +348,15 @@ app.post("/api/download", async (req, res) => {
           });
         });
 
-        const files = fs.readdirSync(TEMP_DIR).filter((f) => f.startsWith(jobId));
+        const files = fs
+          .readdirSync(TEMP_DIR)
+          .filter((f) => f.startsWith(jobId));
         if (files.length === 0) throw new Error("Output file not found");
 
         const filePath = path.join(TEMP_DIR, files[0]);
-        const ext = path.extname(files[0]).replace(".", "") || (type === "audio" ? "mp3" : "mp4");
+        const ext =
+          path.extname(files[0]).replace(".", "") ||
+          (type === "audio" ? "mp3" : "mp4");
         const safeTitle = sanitizeFilename(videoTitle);
         const filename = `${safeTitle}.${ext}`;
 
