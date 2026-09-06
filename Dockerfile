@@ -1,13 +1,15 @@
 FROM node:22-bookworm-slim
 
-# Install yt-dlp and ffmpeg
+# System deps + latest yt-dlp (pip can lag; binary is freshest)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
     ffmpeg \
     curl \
     ca-certificates \
-    && pip3 install --break-system-packages -U yt-dlp \
+    && curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp \
+    && chmod a+rx /usr/local/bin/yt-dlp \
+    && yt-dlp --version \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
@@ -24,5 +26,4 @@ ENV TEMP_DIR=/tmp/vidora
 
 EXPOSE 4000
 
-# Run TypeScript directly with tsx (no separate build step)
 CMD ["npx", "tsx", "src/index.ts"]
