@@ -16,6 +16,9 @@ const TEMP_DIR = process.env.TEMP_DIR || path.join(os.tmpdir(), "vidora");
 const MAX_DURATION_MIN = 30;
 const COOKIES_FILE = process.env.YTDLP_COOKIES_FILE || "";
 
+// Try these clients in order — tv often skips the datacenter bot wall
+const PLAYER_CLIENTS = ["tv", "android", "mweb", "web"];
+
 if (!fs.existsSync(TEMP_DIR)) {
   fs.mkdirSync(TEMP_DIR, { recursive: true });
 }
@@ -87,21 +90,24 @@ const downloadSchema = urlSchema.extend({
   quality: z.string().default("best"),
 });
 
-function baseYtArgs(): string[] {
-  const args = [
+function cookieArgs(): string[] {
+  if (COOKIES_FILE && fs.existsSync(COOKIES_FILE)) {
+    return ["--cookies", COOKIES_FILE];
+  }
+  return [];
+}
+
+function clientArgs(client: string): string[] {
+  return [
     "--no-playlist",
     "--no-warnings",
     "--force-ipv4",
     "--extractor-args",
-    "youtube:player_client=android,ios,tv,web",
+    `youtube:player_client=${client}`,
+    ...cookieArgs(),
   ];
-  if (COOKIES_FILE && fs.existsSync(COOKIES_FILE)) {
-    args.push("--cookies", COOKIES_FILE);
-  }
-  return args;
 }
 
-/** Map UI quality to a yt-dlp -f string (with fallbacks built in) */
 function videoFormatForQuality(quality: string): string {
   const map: Record<string, string> = {
     best: "bv*+ba/b",
@@ -111,6 +117,12 @@ function videoFormatForQuality(quality: string): string {
     "360p": "bv*[height<=360]+ba/b[height<=360]/bv*+ba/b",
   };
   return map[quality] || map.best;
+}
+
+function isBotBlock(msg: string): boolean {
+  return /Sign in to confirm|not a bot|bot check|PO Token|confirm you.re not/i.test(
+    msg
+  );
 }
 
 function runYtDlp(args: string[]): Promise<{ stdout: string; stderr: string }> {
@@ -149,6 +161,30 @@ function runYtDlp(args: string[]): Promise<{ stdout: string; stderr: string }> {
       reject(err);
     });
   });
+}
+
+/** Try each player client until one works (bypasses many bot walls) */
+async function runYtDlpWithFallback(
+  buildArgs: (client: string) => string[]
+): Promise<{ stdout: string; stderr: string; client: string }> {
+  let lastErr: Error | null = null;
+
+  for (const client of PLAYER_CLIENTS) {
+    try {
+      const result = await runYtDlp(buildArgs(client));
+      return { ...result, client };
+    } catch (e: any) {
+      lastErr = e;
+      const msg = String(e.message || "");
+      console.warn(`yt-dlp client=${client} failed:`, msg.slice(0, 120));
+      // Only rotate clients on bot/auth style failures; other errors stop early
+      if (!isBotBlock(msg) && !/unavailable|private|age/i.test(msg)) {
+        // still try next client for format/network glitches
+      }
+    }
+  }
+
+  throw lastErr || new Error("All YouTube clients failed");
 }
 
 function formatDuration(seconds: number): string {
@@ -198,8 +234,8 @@ function contentTypeForExt(ext: string): string {
 
 function friendlyError(raw: string): string {
   let msg = raw.replace(/^ERROR:\s*/i, "");
-  if (/Sign in to confirm|not a bot|cookies/i.test(msg))
-    return "YouTube blocked this request (bot check). Try another video or try again later.";
+  if (isBotBlock(msg))
+    return "YouTube is blocking this server IP. Try again later, or host the API on a different provider.";
   if (/unavailable|private|not available/i.test(msg))
     return "This video is unavailable or private.";
   if (/age/i.test(msg)) return "Age-restricted videos are not supported.";
@@ -214,9 +250,9 @@ app.post("/api/info", async (req, res) => {
   try {
     const { url } = urlSchema.parse(req.body);
 
-    const { stdout } = await runYtDlp([
+    const { stdout } = await runYtDlpWithFallback((client) => [
       "--dump-json",
-      ...baseYtArgs(),
+      ...clientArgs(client),
       url,
     ]);
 
@@ -281,10 +317,10 @@ app.post("/api/download", async (req, res) => {
       try {
         let videoTitle = "vidora-download";
         try {
-          const { stdout: titleOut } = await runYtDlp([
+          const { stdout: titleOut } = await runYtDlpWithFallback((client) => [
             "--print",
             "%(title)s",
-            ...baseYtArgs(),
+            ...clientArgs(client),
             url,
           ]);
           const t = titleOut.trim().split("\n")[0];
@@ -293,83 +329,106 @@ app.post("/api/download", async (req, res) => {
           // keep fallback
         }
 
-        const args: string[] = [
-          ...baseYtArgs(),
-          "-o",
-          outTemplate,
-          "--newline",
-          "--progress",
-        ];
+        let lastErr: Error | null = null;
+        let succeeded = false;
 
-        if (type === "audio") {
-          args.push("-x", "--audio-format", "mp3");
-          if (quality === "320k") args.push("--audio-quality", "0");
-          else if (quality === "192k") args.push("--audio-quality", "2");
-          else args.push("--audio-quality", "5");
-        } else {
-          args.push(
-            "--merge-output-format",
-            "mp4",
-            "-f",
-            videoFormatForQuality(quality)
-          );
+        for (const client of PLAYER_CLIENTS) {
+          // Clean partial files from previous attempt
+          try {
+            for (const f of fs.readdirSync(TEMP_DIR)) {
+              if (f.startsWith(jobId)) fs.unlinkSync(path.join(TEMP_DIR, f));
+            }
+          } catch {}
+
+          const args: string[] = [
+            ...clientArgs(client),
+            "-o",
+            outTemplate,
+            "--newline",
+            "--progress",
+          ];
+
+          if (type === "audio") {
+            args.push("-x", "--audio-format", "mp3");
+            if (quality === "320k") args.push("--audio-quality", "0");
+            else if (quality === "192k") args.push("--audio-quality", "2");
+            else args.push("--audio-quality", "5");
+          } else {
+            args.push(
+              "--merge-output-format",
+              "mp4",
+              "-f",
+              videoFormatForQuality(quality)
+            );
+          }
+
+          args.push(url);
+          console.log(`yt-dlp client=${client}:`, args.join(" "));
+          job.message = `Downloading (${client})...`;
+
+          try {
+            await new Promise<void>((resolve, reject) => {
+              const proc = spawn("yt-dlp", args, {
+                stdio: ["ignore", "pipe", "pipe"],
+              });
+
+              let lastProgress = 10;
+              let stderr = "";
+
+              const onData = (d: Buffer) => {
+                const line = d.toString();
+                stderr += line;
+                const match = line.match(/(\d+\.?\d*)%/);
+                if (match) {
+                  const p = Math.min(
+                    90,
+                    Math.round(parseFloat(match[1]) * 0.8) + 10
+                  );
+                  if (p > lastProgress) {
+                    lastProgress = p;
+                    job.progress = p;
+                    job.message = `Downloading... ${Math.round(parseFloat(match[1]))}%`;
+                  }
+                }
+              };
+
+              proc.stdout.on("data", onData);
+              proc.stderr.on("data", onData);
+
+              const timeout = setTimeout(() => {
+                proc.kill("SIGKILL");
+                reject(new Error("Download timed out"));
+              }, 8 * 60 * 1000);
+
+              proc.on("close", (code) => {
+                clearTimeout(timeout);
+                if (code === 0) resolve();
+                else {
+                  const lines = stderr.split("\n").filter(Boolean);
+                  const errorLine =
+                    lines.find((l) => /ERROR:/i.test(l)) ||
+                    lines.slice(-2).join(" ") ||
+                    `yt-dlp failed with code ${code}`;
+                  reject(new Error(errorLine.slice(0, 400)));
+                }
+              });
+
+              proc.on("error", (err) => {
+                clearTimeout(timeout);
+                reject(err);
+              });
+            });
+
+            succeeded = true;
+            lastErr = null;
+            break;
+          } catch (err: any) {
+            lastErr = err;
+            console.warn(`download client=${client} failed:`, err.message);
+          }
         }
 
-        args.push(url);
-
-        console.log("yt-dlp args:", args.join(" "));
-
-        await new Promise<void>((resolve, reject) => {
-          const proc = spawn("yt-dlp", args, {
-            stdio: ["ignore", "pipe", "pipe"],
-          });
-
-          let lastProgress = 10;
-          let stderr = "";
-
-          const onData = (d: Buffer) => {
-            const line = d.toString();
-            stderr += line;
-            const match = line.match(/(\d+\.?\d*)%/);
-            if (match) {
-              const p = Math.min(
-                90,
-                Math.round(parseFloat(match[1]) * 0.8) + 10
-              );
-              if (p > lastProgress) {
-                lastProgress = p;
-                job.progress = p;
-                job.message = `Downloading... ${Math.round(parseFloat(match[1]))}%`;
-              }
-            }
-          };
-
-          proc.stdout.on("data", onData);
-          proc.stderr.on("data", onData);
-
-          const timeout = setTimeout(() => {
-            proc.kill("SIGKILL");
-            reject(new Error("Download timed out"));
-          }, 8 * 60 * 1000);
-
-          proc.on("close", (code) => {
-            clearTimeout(timeout);
-            if (code === 0) resolve();
-            else {
-              const lines = stderr.split("\n").filter(Boolean);
-              const errorLine =
-                lines.find((l) => /ERROR:/i.test(l)) ||
-                lines.slice(-2).join(" ") ||
-                `yt-dlp failed with code ${code}`;
-              reject(new Error(errorLine.slice(0, 400)));
-            }
-          });
-
-          proc.on("error", (err) => {
-            clearTimeout(timeout);
-            reject(err);
-          });
-        });
+        if (!succeeded) throw lastErr || new Error("Download failed");
 
         const files = fs
           .readdirSync(TEMP_DIR)
