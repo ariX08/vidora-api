@@ -15,43 +15,75 @@ app.set("trust proxy", 1);
 const TEMP_DIR = process.env.TEMP_DIR || path.join(os.tmpdir(), "vidora");
 const MAX_DURATION_MIN = Number(process.env.MAX_DURATION_MIN || 30);
 const PROXY_URL = (process.env.YTDLP_PROXY || process.env.HTTPS_PROXY || process.env.HTTP_PROXY || "").trim();
-const CONCURRENT_FRAGMENTS = Math.max(1, Math.min(16, Number(process.env.YTDLP_CONCURRENT_FRAGMENTS || 8)));
-const MAX_PARALLEL_CLIENTS = 3;
+const CONCURRENT_FRAGMENTS = Math.max(1, Math.min(8, Number(process.env.YTDLP_CONCURRENT_FRAGMENTS || 4)));
 const BGUTIL_POT_URL = (process.env.BGUTIL_POT_URL || "http://127.0.0.1:4416").trim();
 
-// Resolve cookies: file path OR paste Netscape cookies into YTDLP_COOKIES env
 const COOKIES_PATH = path.join(TEMP_DIR, "cookies.txt");
+
+function looksLikeNetscape(text: string): boolean {
+  return (
+    /# Netscape HTTP Cookie File/i.test(text) ||
+    /\.youtube\.com\s/i.test(text) ||
+    /youtube\.com\t/i.test(text)
+  );
+}
+
 function resolveCookiesFile(): string {
   const fromFile = (process.env.YTDLP_COOKIES_FILE || "").trim();
-  if (fromFile && fs.existsSync(fromFile)) return fromFile;
+  if (fromFile && fs.existsSync(fromFile)) {
+    console.log("[vidora] cookies from file:", fromFile);
+    return fromFile;
+  }
+
+  // Prefer base64 — survives Render multiline env mangling
+  const b64 = (process.env.YTDLP_COOKIES_B64 || "").trim();
+  if (b64) {
+    try {
+      const decoded = Buffer.from(b64, "base64").toString("utf8");
+      if (!looksLikeNetscape(decoded)) {
+        console.warn("[vidora] YTDLP_COOKIES_B64 decoded but doesn't look like Netscape cookies");
+      }
+      if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
+      fs.writeFileSync(COOKIES_PATH, decoded.endsWith("\n") ? decoded : decoded + "\n", "utf8");
+      console.log("[vidora] cookies from YTDLP_COOKIES_B64, bytes=", decoded.length);
+      return COOKIES_PATH;
+    } catch (e) {
+      console.error("[vidora] failed to decode YTDLP_COOKIES_B64", e);
+    }
+  }
 
   const raw = (process.env.YTDLP_COOKIES || "").trim();
   if (!raw) return "";
 
-  // Accept both real newlines and \n escaped strings from Render env UI
-  const content = raw.includes("\n") ? raw : raw.replace(/\\n/g, "\n");
-  if (!content.includes("youtube") && !content.includes(".youtube.com")) {
-    console.warn("[vidora] YTDLP_COOKIES set but doesn't look like YouTube cookies");
+  // Handle both real newlines and escaped \\n from env UIs
+  let content = raw.includes("\n") ? raw : raw.replace(/\\n/g, "\n");
+  // Some UIs turn tabs into spaces — try to recover common pattern
+  if (!/\t/.test(content) && /\.youtube\.com\s+TRUE\s+/i.test(content)) {
+    content = content.replace(/(\S)\s+(TRUE|FALSE)\s+/gi, "$1\t$2\t");
   }
+
+  if (!looksLikeNetscape(content)) {
+    console.warn("[vidora] YTDLP_COOKIES set but content does not look like Netscape cookies.txt");
+  }
+
   try {
     if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
     fs.writeFileSync(COOKIES_PATH, content.endsWith("\n") ? content : content + "\n", "utf8");
+    console.log("[vidora] cookies from YTDLP_COOKIES, bytes=", content.length);
     return COOKIES_PATH;
   } catch (e) {
-    console.error("[vidora] failed to write cookies file", e);
+    console.error("[vidora] failed to write cookies", e);
     return "";
   }
 }
 
 const COOKIES_FILE = resolveCookiesFile();
-const HAS_COOKIES = Boolean(COOKIES_FILE);
+const HAS_COOKIES = Boolean(COOKIES_FILE && fs.existsSync(COOKIES_FILE));
 
-// With cookies, prefer clients that honor them. Without, lean on tv/android.
+// Sequential by default — parallel races burn CPU/RAM on free Render and confuse YouTube
 const PLAYER_CLIENTS = (
   process.env.YTDLP_PLAYER_CLIENTS ||
-  (HAS_COOKIES
-    ? "tv,web,mweb,web_embedded,android"
-    : "tv,mweb,web_embedded,android,web")
+  (HAS_COOKIES ? "tv,web,mweb,android" : "tv,mweb,android,web_embedded")
 )
   .split(",")
   .map((c) => c.trim())
@@ -159,12 +191,7 @@ function proxyArgs(): string[] {
 }
 
 function baseYtArgs(client: string): string[] {
-  // With cookies, don't skip webpage (helps auth). Without, skip for speed.
-  const skip = HAS_COOKIES ? "" : ";player_skip=webpage";
-  const extractorParts = [
-    `youtube:player_client=${client}${skip}`,
-  ];
-
+  const extractorParts = [`youtube:player_client=${client}`];
   if (BGUTIL_POT_URL) {
     extractorParts.push(`youtubepot-bgutilhttp:base_url=${BGUTIL_POT_URL}`);
   }
@@ -173,9 +200,9 @@ function baseYtArgs(client: string): string[] {
     "--no-playlist",
     "--no-warnings",
     "--force-ipv4",
-    "--socket-timeout", "15",
-    "--retries", "2",
-    "--fragment-retries", "3",
+    "--socket-timeout", "12",
+    "--retries", "1",
+    "--fragment-retries", "2",
     "--concurrent-fragments", String(CONCURRENT_FRAGMENTS),
     "--extractor-args",
     extractorParts.join(";"),
@@ -203,7 +230,7 @@ function isBotBlock(msg: string): boolean {
 
 function runYtDlp(
   args: string[],
-  timeoutMs = 30_000
+  timeoutMs = 22_000
 ): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     const proc = spawn("yt-dlp", args, {
@@ -232,7 +259,7 @@ function runYtDlp(
           lines.find((l) => /ERROR:/i.test(l)) ||
           lines.slice(-3).join(" ") ||
           `yt-dlp exited with code ${code}`;
-        reject(new Error(errorLine.slice(0, 500)));
+        reject(new Error(errorLine.slice(0, 600)));
       }
     });
 
@@ -243,74 +270,30 @@ function runYtDlp(
   });
 }
 
+/** Sequential clients — faster overall on free tier + less IP pressure */
 async function runYtDlpWithFallback(
   buildArgs: (client: string) => string[],
-  timeoutMs = 25_000
+  timeoutMs = 20_000
 ): Promise<{ stdout: string; stderr: string; client: string }> {
   const clients = orderedClients();
   if (clients.length === 0) throw new Error("No player clients configured");
 
-  const batch = clients.slice(0, MAX_PARALLEL_CLIENTS);
-  const rest = clients.slice(MAX_PARALLEL_CLIENTS);
-
   const errors: Error[] = [];
-  let settled = 0;
 
-  return new Promise((resolve, reject) => {
-    let done = false;
-
-    const finish = (
-      result: { stdout: string; stderr: string; client: string } | null,
-      err?: Error
-    ) => {
-      if (done) return;
-      if (result) {
-        done = true;
-        lastGoodClient = result.client;
-        clientSuccess.set(result.client, Date.now());
-        resolve(result);
-        return;
-      }
-      settled++;
-      if (err) errors.push(err);
-      if (settled >= batch.length) {
-        (async () => {
-          for (const client of rest) {
-            try {
-              const r = await runYtDlp(buildArgs(client), timeoutMs);
-              done = true;
-              lastGoodClient = client;
-              clientSuccess.set(client, Date.now());
-              resolve({ ...r, client });
-              return;
-            } catch (e: any) {
-              errors.push(e);
-              console.warn(
-                `yt-dlp client=${client} failed:`,
-                String(e.message || e).slice(0, 140)
-              );
-            }
-          }
-          done = true;
-          reject(
-            errors[errors.length - 1] || new Error("All YouTube clients failed")
-          );
-        })();
-      }
-    };
-
-    for (const client of batch) {
-      runYtDlp(buildArgs(client), timeoutMs)
-        .then((r) => finish({ ...r, client }))
-        .catch((e: any) => {
-          console.warn(
-            `yt-dlp client=${client} failed:`,
-            String(e.message || e).slice(0, 140)
-          );
-          finish(null, e);
-        });
+  for (const client of clients) {
+    try {
+      const r = await runYtDlp(buildArgs(client), timeoutMs);
+      lastGoodClient = client;
+      clientSuccess.set(client, Date.now());
+      return { ...r, client };
+    } catch (e: any) {
+      errors.push(e);
+      console.warn(`yt-dlp client=${client} failed:`, String(e.message || e).slice(0, 180));
+      // If clearly bot-blocked, still try next client (cookies + different client can help)
     }
-  });
+  }
+
+  throw errors[errors.length - 1] || new Error("All YouTube clients failed");
 }
 
 function formatDuration(seconds: number): string {
@@ -377,6 +360,16 @@ function friendlyError(raw: string): string {
 }
 
 app.get("/health", (_req, res) => {
+  let cookieBytes = 0;
+  let cookieLooksOk = false;
+  try {
+    if (COOKIES_FILE && fs.existsSync(COOKIES_FILE)) {
+      const t = fs.readFileSync(COOKIES_FILE, "utf8");
+      cookieBytes = t.length;
+      cookieLooksOk = looksLikeNetscape(t);
+    }
+  } catch {}
+
   res.json({
     status: "ok",
     service: "vidora-backend",
@@ -385,6 +378,8 @@ app.get("/health", (_req, res) => {
     concurrentFragments: CONCURRENT_FRAGMENTS,
     potProvider: BGUTIL_POT_URL,
     cookiesConfigured: HAS_COOKIES,
+    cookiesBytes: cookieBytes,
+    cookiesLookValid: cookieLooksOk,
     proxyConfigured: Boolean(PROXY_URL),
   });
 });
@@ -395,7 +390,7 @@ app.post("/api/info", async (req, res) => {
 
     const { stdout, client } = await runYtDlpWithFallback(
       (c) => ["--dump-json", "--no-download", ...baseYtArgs(c), url],
-      28_000
+      22_000
     );
 
     const meta = JSON.parse(stdout);
@@ -470,7 +465,7 @@ app.post("/api/download", async (req, res) => {
               ...baseYtArgs(c),
               url,
             ],
-            25_000
+            20_000
           );
           const t = metaOut.trim().split("\n")[0];
           if (t) videoTitle = t;
@@ -487,7 +482,7 @@ app.post("/api/download", async (req, res) => {
         const tryOrder = [
           preferredClient,
           ...orderedClients().filter((c) => c !== preferredClient),
-        ].slice(0, 4);
+        ].slice(0, 3);
 
         let lastErr: Error | null = null;
         let succeeded = false;
@@ -564,12 +559,12 @@ app.post("/api/download", async (req, res) => {
                   proc.kill("SIGKILL");
                   reject(new Error("No progress"));
                 }
-              }, 50_000);
+              }, 35_000);
 
               const timeout = setTimeout(() => {
                 proc.kill("SIGKILL");
                 reject(new Error("Download timed out"));
-              }, 10 * 60 * 1000);
+              }, 8 * 60 * 1000);
 
               proc.on("close", (code) => {
                 clearTimeout(timeout);
@@ -581,7 +576,7 @@ app.post("/api/download", async (req, res) => {
                     lines.find((l) => /ERROR:/i.test(l)) ||
                     lines.slice(-2).join(" ") ||
                     `yt-dlp failed with code ${code}`;
-                  reject(new Error(errorLine.slice(0, 500)));
+                  reject(new Error(errorLine.slice(0, 600)));
                 }
               });
 
@@ -600,7 +595,9 @@ app.post("/api/download", async (req, res) => {
           } catch (err: any) {
             lastErr = err;
             console.warn(`download client=${client} failed:`, err.message);
-            if (isBotBlock(String(err.message || ""))) break;
+            if (isBotBlock(String(err.message || ""))) {
+              // try next client
+            }
           }
         }
 
@@ -689,6 +686,6 @@ app.listen(PORT, () => {
   console.log(`Vidora backend listening on :${PORT}`);
   console.log(`Clients: ${PLAYER_CLIENTS.join(", ")}`);
   console.log(`POT provider: ${BGUTIL_POT_URL}`);
-  console.log(`Cookies: ${HAS_COOKIES ? "yes" : "NO — most videos will fail on cloud IPs"}`);
+  console.log(`Cookies: ${HAS_COOKIES ? "yes" : "NO"}`);
   console.log(`Proxy: ${PROXY_URL ? "yes" : "no"}`);
 });
