@@ -19,10 +19,11 @@ const PROXY_URL = (process.env.YTDLP_PROXY || process.env.HTTPS_PROXY || process
 const CONCURRENT_FRAGMENTS = Math.max(1, Math.min(16, Number(process.env.YTDLP_CONCURRENT_FRAGMENTS || 8)));
 const MAX_PARALLEL_CLIENTS = 3;
 
-// Keep this list short. Extra clients only add latency when everything is blocked.
+// Clients that historically work better on datacenter IPs without PO tokens / proxy.
+// Order matters: first success wins.
 const PLAYER_CLIENTS = (
   process.env.YTDLP_PLAYER_CLIENTS ||
-  "tv,android,web_embedded,mweb"
+  "tv,tv_samsung,android_vr,web_embedded,android,mweb"
 )
   .split(",")
   .map((c) => c.trim())
@@ -164,7 +165,7 @@ function isBotBlock(msg: string): boolean {
 
 function runYtDlp(
   args: string[],
-  timeoutMs = 25_000
+  timeoutMs = 22_000
 ): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     const proc = spawn("yt-dlp", args, {
@@ -204,10 +205,10 @@ function runYtDlp(
   });
 }
 
-/** Race clients in parallel. First success wins. Hard timeout per client. */
+/** Race clients in parallel. First success wins. */
 async function runYtDlpWithFallback(
   buildArgs: (client: string) => string[],
-  timeoutMs = 22_000
+  timeoutMs = 20_000
 ): Promise<{ stdout: string; stderr: string; client: string }> {
   const clients = orderedClients();
   if (clients.length === 0) throw new Error("No player clients configured");
@@ -215,14 +216,16 @@ async function runYtDlpWithFallback(
   const batch = clients.slice(0, MAX_PARALLEL_CLIENTS);
   const rest = clients.slice(MAX_PARALLEL_CLIENTS);
 
-  // AbortController-style: race all in batch, return on first success
   const errors: Error[] = [];
   let settled = 0;
 
   return new Promise((resolve, reject) => {
     let done = false;
 
-    const finish = (result: { stdout: string; stderr: string; client: string } | null, err?: Error) => {
+    const finish = (
+      result: { stdout: string; stderr: string; client: string } | null,
+      err?: Error
+    ) => {
       if (done) return;
       if (result) {
         done = true;
@@ -233,7 +236,6 @@ async function runYtDlpWithFallback(
       }
       settled++;
       if (err) errors.push(err);
-      // when entire batch failed, try remaining sequentially or reject
       if (settled >= batch.length) {
         (async () => {
           for (const client of rest) {
@@ -246,11 +248,16 @@ async function runYtDlpWithFallback(
               return;
             } catch (e: any) {
               errors.push(e);
-              console.warn(`yt-dlp client=${client} failed:`, String(e.message || e).slice(0, 120));
+              console.warn(
+                `yt-dlp client=${client} failed:`,
+                String(e.message || e).slice(0, 120)
+              );
             }
           }
           done = true;
-          reject(errors[errors.length - 1] || new Error("All YouTube clients failed"));
+          reject(
+            errors[errors.length - 1] || new Error("All YouTube clients failed")
+          );
         })();
       }
     };
@@ -259,7 +266,10 @@ async function runYtDlpWithFallback(
       runYtDlp(buildArgs(client), timeoutMs)
         .then((r) => finish({ ...r, client }))
         .catch((e: any) => {
-          console.warn(`yt-dlp client=${client} failed:`, String(e.message || e).slice(0, 120));
+          console.warn(
+            `yt-dlp client=${client} failed:`,
+            String(e.message || e).slice(0, 120)
+          );
           finish(null, e);
         });
     }
@@ -311,15 +321,24 @@ function contentTypeForExt(ext: string): string {
   return map[ext.toLowerCase()] || "application/octet-stream";
 }
 
+/** User-facing errors only — no technical / admin language */
 function friendlyError(raw: string): string {
-  let msg = raw.replace(/^ERROR:\s*/i, "");
-  if (isBotBlock(msg))
-    return "YouTube is blocking this server IP. Set YTDLP_PROXY to a residential proxy (see README)." ;
-  if (/unavailable|private|not available/i.test(msg))
+  const msg = String(raw || "").replace(/^ERROR:\s*/i, "");
+
+  if (isBotBlock(msg) || /timed out|No progress/i.test(msg)) {
+    return "This video can’t be downloaded right now. Please try again in a few minutes.";
+  }
+  if (/unavailable|private|not available/i.test(msg)) {
     return "This video is unavailable or private.";
-  if (/age/i.test(msg)) return "Age-restricted videos need cookies (YTDLP_COOKIES_FILE).";
-  if (/timed out/i.test(msg)) return "YouTube request timed out. Try a proxy or different host.";
-  return msg.slice(0, 250);
+  }
+  if (/age/i.test(msg)) {
+    return "This video is age-restricted and can’t be downloaded.";
+  }
+  if (/Unsupported URL|Only YouTube/i.test(msg)) {
+    return "Please enter a valid YouTube link.";
+  }
+  // Generic fallback for end users
+  return "Something went wrong while processing this video. Please try again.";
 }
 
 app.get("/health", (_req, res) => {
@@ -330,10 +349,6 @@ app.get("/health", (_req, res) => {
     lastGoodClient,
     concurrentFragments: CONCURRENT_FRAGMENTS,
     proxyConfigured: Boolean(PROXY_URL),
-    // never leak the full proxy URL
-    proxyHost: PROXY_URL ? (() => {
-      try { return new URL(PROXY_URL).host; } catch { return "set"; }
-    })() : null,
   });
 });
 
@@ -343,7 +358,7 @@ app.post("/api/info", async (req, res) => {
 
     const { stdout, client } = await runYtDlpWithFallback(
       (c) => ["--dump-json", "--no-download", ...baseYtArgs(c), url],
-      20_000
+      18_000
     );
 
     const meta = JSON.parse(stdout);
@@ -402,14 +417,13 @@ app.post("/api/download", async (req, res) => {
     (async () => {
       const job = jobs.get(jobId)!;
       job.status = "processing";
-      job.message = "Resolving...";
+      job.message = "Getting video info…";
       job.progress = 5;
 
       try {
         let videoTitle = "vidora-download";
         let preferredClient = lastGoodClient || orderedClients()[0];
 
-        // Fast metadata probe (hard 18s total budget)
         try {
           const { stdout: metaOut, client } = await runYtDlpWithFallback(
             (c) => [
@@ -419,26 +433,24 @@ app.post("/api/download", async (req, res) => {
               ...baseYtArgs(c),
               url,
             ],
-            18_000
+            16_000
           );
           const t = metaOut.trim().split("\n")[0];
           if (t) videoTitle = t;
           preferredClient = client;
           job.client = client;
-          job.message = `Using ${client}…`;
+          job.message = "Starting download…";
           job.progress = 12;
         } catch (probeErr: any) {
-          // If even the probe fails with bot block, fail the job immediately
           if (isBotBlock(String(probeErr?.message || ""))) {
             throw probeErr;
           }
-          // otherwise continue and try download clients
         }
 
         const tryOrder = [
           preferredClient,
           ...orderedClients().filter((c) => c !== preferredClient),
-        ].slice(0, 4); // never try more than 4 clients for download
+        ].slice(0, 4);
 
         let lastErr: Error | null = null;
         let succeeded = false;
@@ -475,7 +487,7 @@ app.post("/api/download", async (req, res) => {
 
           args.push(url);
           console.log(`yt-dlp client=${client}`);
-          job.message = `Downloading (${client})…`;
+          job.message = "Downloading…";
           job.client = client;
 
           try {
@@ -510,13 +522,12 @@ app.post("/api/download", async (req, res) => {
               proc.stdout.on("data", onData);
               proc.stderr.on("data", onData);
 
-              // Fail fast if no progress within 45s (bot wall / hanging)
               const stallTimer = setTimeout(() => {
                 if (!sawProgress) {
                   proc.kill("SIGKILL");
-                  reject(new Error("No progress — likely blocked or dead connection"));
+                  reject(new Error("No progress"));
                 }
-              }, 45_000);
+              }, 40_000);
 
               const timeout = setTimeout(() => {
                 proc.kill("SIGKILL");
@@ -552,10 +563,7 @@ app.post("/api/download", async (req, res) => {
           } catch (err: any) {
             lastErr = err;
             console.warn(`download client=${client} failed:`, err.message);
-            // On clear bot-block, stop trying more clients immediately
-            if (isBotBlock(String(err.message || ""))) {
-              break;
-            }
+            if (isBotBlock(String(err.message || ""))) break;
           }
         }
 
@@ -590,11 +598,11 @@ app.post("/api/download", async (req, res) => {
         job.status = "failed";
         job.error = friendlyError(String(e.message || "Processing failed"));
         job.message = job.error;
-        console.error("download job error:", e);
+        console.error("download job error:", e.message);
       }
     })();
   } catch (e: any) {
-    res.status(400).json({ error: e.message || "Invalid request" });
+    res.status(400).json({ error: friendlyError(e.message || "Invalid request") });
   }
 });
 
@@ -642,15 +650,6 @@ app.get("/api/file/:id", (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`Vidora backend listening on :${PORT}`);
-  console.log(`Temp dir: ${TEMP_DIR}`);
   console.log(`Clients: ${PLAYER_CLIENTS.join(", ")}`);
-  console.log(`Concurrent fragments: ${CONCURRENT_FRAGMENTS}`);
-  console.log(`Proxy configured: ${Boolean(PROXY_URL)}`);
-  if (PROXY_URL) {
-    try {
-      console.log(`Proxy host: ${new URL(PROXY_URL).host}`);
-    } catch {
-      console.log(`Proxy: set (invalid URL format?)`);
-    }
-  }
+  console.log(`Proxy: ${PROXY_URL ? "yes" : "no"}`);
 });
