@@ -15,23 +15,21 @@ app.set("trust proxy", 1);
 const TEMP_DIR = process.env.TEMP_DIR || path.join(os.tmpdir(), "vidora");
 const MAX_DURATION_MIN = Number(process.env.MAX_DURATION_MIN || 30);
 const COOKIES_FILE = process.env.YTDLP_COOKIES_FILE || "";
-const PROXY_URL = process.env.YTDLP_PROXY || process.env.HTTPS_PROXY || process.env.HTTP_PROXY || "";
+const PROXY_URL = (process.env.YTDLP_PROXY || process.env.HTTPS_PROXY || process.env.HTTP_PROXY || "").trim();
 const CONCURRENT_FRAGMENTS = Math.max(1, Math.min(16, Number(process.env.YTDLP_CONCURRENT_FRAGMENTS || 8)));
 const MAX_PARALLEL_CLIENTS = 3;
 
-// 2026-tuned order: clients that currently dodge most bot walls + give good formats.
-// tv / tv_simply / android_vr are usually the fastest path on datacenter IPs.
+// Keep this list short. Extra clients only add latency when everything is blocked.
 const PLAYER_CLIENTS = (
   process.env.YTDLP_PLAYER_CLIENTS ||
-  "tv,tv_simply,android,android_vr,web_embedded,mweb,web"
+  "tv,android,web_embedded,mweb"
 )
   .split(",")
   .map((c) => c.trim())
   .filter(Boolean);
 
-// Short-lived memory of which client worked last (per process)
 let lastGoodClient: string | null = null;
-const clientSuccess = new Map<string, number>(); // client -> last success ts
+const clientSuccess = new Map<string, number>();
 
 if (!fs.existsSync(TEMP_DIR)) {
   fs.mkdirSync(TEMP_DIR, { recursive: true });
@@ -74,7 +72,6 @@ setInterval(() => {
       jobs.delete(id);
     }
   }
-  // prune stale client scores
   for (const [c, ts] of clientSuccess) {
     if (now - ts > 30 * 60 * 1000) clientSuccess.delete(c);
   }
@@ -110,7 +107,7 @@ const downloadSchema = urlSchema.extend({
 });
 
 function orderedClients(): string[] {
-  const scored = [...PLAYER_CLIENTS].sort((a, b) => {
+  return [...PLAYER_CLIENTS].sort((a, b) => {
     const sa = clientSuccess.get(a) || 0;
     const sb = clientSuccess.get(b) || 0;
     if (sa !== sb) return sb - sa;
@@ -118,7 +115,6 @@ function orderedClients(): string[] {
     if (b === lastGoodClient) return 1;
     return 0;
   });
-  return scored;
 }
 
 function cookieArgs(): string[] {
@@ -133,20 +129,19 @@ function proxyArgs(): string[] {
   return [];
 }
 
-function baseYtArgs(client: string, extra: string[] = []): string[] {
+function baseYtArgs(client: string): string[] {
   return [
     "--no-playlist",
     "--no-warnings",
     "--force-ipv4",
-    "--socket-timeout", "15",
-    "--retries", "3",
-    "--fragment-retries", "5",
+    "--socket-timeout", "12",
+    "--retries", "2",
+    "--fragment-retries", "3",
     "--concurrent-fragments", String(CONCURRENT_FRAGMENTS),
     "--extractor-args",
     `youtube:player_client=${client};player_skip=webpage`,
     ...cookieArgs(),
     ...proxyArgs(),
-    ...extra,
   ];
 }
 
@@ -162,14 +157,14 @@ function videoFormatForQuality(quality: string): string {
 }
 
 function isBotBlock(msg: string): boolean {
-  return /Sign in to confirm|not a bot|bot check|PO Token|confirm you.re not|HTTP Error 403/i.test(
+  return /Sign in to confirm|not a bot|bot check|PO Token|confirm you.re not|HTTP Error 403|blocked/i.test(
     msg
   );
 }
 
 function runYtDlp(
   args: string[],
-  timeoutMs = 90_000
+  timeoutMs = 25_000
 ): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     const proc = spawn("yt-dlp", args, {
@@ -209,64 +204,66 @@ function runYtDlp(
   });
 }
 
-/** Race the top N clients in parallel — first success wins (big latency win). */
+/** Race clients in parallel. First success wins. Hard timeout per client. */
 async function runYtDlpWithFallback(
   buildArgs: (client: string) => string[],
-  timeoutMs = 90_000
+  timeoutMs = 22_000
 ): Promise<{ stdout: string; stderr: string; client: string }> {
   const clients = orderedClients();
+  if (clients.length === 0) throw new Error("No player clients configured");
+
   const batch = clients.slice(0, MAX_PARALLEL_CLIENTS);
   const rest = clients.slice(MAX_PARALLEL_CLIENTS);
 
-  const tryClient = async (client: string) => {
-    const result = await runYtDlp(buildArgs(client), timeoutMs);
-    lastGoodClient = client;
-    clientSuccess.set(client, Date.now());
-    return { ...result, client };
-  };
+  // AbortController-style: race all in batch, return on first success
+  const errors: Error[] = [];
+  let settled = 0;
 
-  // Parallel race on first batch
-  if (batch.length > 0) {
-    const errors: Error[] = [];
-    const promises = batch.map((c) =>
-      tryClient(c).catch((e: any) => {
-        errors.push(e);
-        console.warn(`yt-dlp client=${c} failed:`, String(e.message || e).slice(0, 140));
-        return null;
-      })
-    );
+  return new Promise((resolve, reject) => {
+    let done = false;
 
-    // Wait for first success or all fail
-    const first = await Promise.race(
-      promises.map(async (p) => {
-        const r = await p;
-        if (r) return r;
-        // keep racing until one succeeds or all settle
-        return new Promise<null>((resolve) => {
-          // no-op, actual resolution handled below
-          setTimeout(() => resolve(null), 0);
-        });
-      })
-    );
-
-    // Properly wait for any success among the batch
-    const results = await Promise.all(promises);
-    const winner = results.find((r) => r !== null);
-    if (winner) return winner;
-
-    // Fall through to remaining clients sequentially
-    for (const client of rest) {
-      try {
-        return await tryClient(client);
-      } catch (e: any) {
-        console.warn(`yt-dlp client=${client} failed:`, String(e.message || e).slice(0, 140));
+    const finish = (result: { stdout: string; stderr: string; client: string } | null, err?: Error) => {
+      if (done) return;
+      if (result) {
+        done = true;
+        lastGoodClient = result.client;
+        clientSuccess.set(result.client, Date.now());
+        resolve(result);
+        return;
       }
+      settled++;
+      if (err) errors.push(err);
+      // when entire batch failed, try remaining sequentially or reject
+      if (settled >= batch.length) {
+        (async () => {
+          for (const client of rest) {
+            try {
+              const r = await runYtDlp(buildArgs(client), timeoutMs);
+              done = true;
+              lastGoodClient = client;
+              clientSuccess.set(client, Date.now());
+              resolve({ ...r, client });
+              return;
+            } catch (e: any) {
+              errors.push(e);
+              console.warn(`yt-dlp client=${client} failed:`, String(e.message || e).slice(0, 120));
+            }
+          }
+          done = true;
+          reject(errors[errors.length - 1] || new Error("All YouTube clients failed"));
+        })();
+      }
+    };
+
+    for (const client of batch) {
+      runYtDlp(buildArgs(client), timeoutMs)
+        .then((r) => finish({ ...r, client }))
+        .catch((e: any) => {
+          console.warn(`yt-dlp client=${client} failed:`, String(e.message || e).slice(0, 120));
+          finish(null, e);
+        });
     }
-
-    throw errors[errors.length - 1] || new Error("All YouTube clients failed");
-  }
-
-  throw new Error("No player clients configured");
+  });
 }
 
 function formatDuration(seconds: number): string {
@@ -317,10 +314,11 @@ function contentTypeForExt(ext: string): string {
 function friendlyError(raw: string): string {
   let msg = raw.replace(/^ERROR:\s*/i, "");
   if (isBotBlock(msg))
-    return "YouTube is blocking this server IP. Set YTDLP_PROXY to a residential proxy, or host on a different provider / try again later.";
+    return "YouTube is blocking this server IP. Set YTDLP_PROXY to a residential proxy (see README)." ;
   if (/unavailable|private|not available/i.test(msg))
     return "This video is unavailable or private.";
   if (/age/i.test(msg)) return "Age-restricted videos need cookies (YTDLP_COOKIES_FILE).";
+  if (/timed out/i.test(msg)) return "YouTube request timed out. Try a proxy or different host.";
   return msg.slice(0, 250);
 }
 
@@ -331,7 +329,11 @@ app.get("/health", (_req, res) => {
     clients: orderedClients(),
     lastGoodClient,
     concurrentFragments: CONCURRENT_FRAGMENTS,
-    proxy: Boolean(PROXY_URL),
+    proxyConfigured: Boolean(PROXY_URL),
+    // never leak the full proxy URL
+    proxyHost: PROXY_URL ? (() => {
+      try { return new URL(PROXY_URL).host; } catch { return "set"; }
+    })() : null,
   });
 });
 
@@ -341,7 +343,7 @@ app.post("/api/info", async (req, res) => {
 
     const { stdout, client } = await runYtDlpWithFallback(
       (c) => ["--dump-json", "--no-download", ...baseYtArgs(c), url],
-      45_000
+      20_000
     );
 
     const meta = JSON.parse(stdout);
@@ -404,10 +406,10 @@ app.post("/api/download", async (req, res) => {
       job.progress = 5;
 
       try {
-        // Single metadata call — get title + confirm a working client (no separate title fetch)
         let videoTitle = "vidora-download";
         let preferredClient = lastGoodClient || orderedClients()[0];
 
+        // Fast metadata probe (hard 18s total budget)
         try {
           const { stdout: metaOut, client } = await runYtDlpWithFallback(
             (c) => [
@@ -417,7 +419,7 @@ app.post("/api/download", async (req, res) => {
               ...baseYtArgs(c),
               url,
             ],
-            40_000
+            18_000
           );
           const t = metaOut.trim().split("\n")[0];
           if (t) videoTitle = t;
@@ -425,21 +427,23 @@ app.post("/api/download", async (req, res) => {
           job.client = client;
           job.message = `Using ${client}…`;
           job.progress = 12;
-        } catch {
-          // continue with preferredClient
+        } catch (probeErr: any) {
+          // If even the probe fails with bot block, fail the job immediately
+          if (isBotBlock(String(probeErr?.message || ""))) {
+            throw probeErr;
+          }
+          // otherwise continue and try download clients
         }
 
-        // Prefer the client that just worked, then the rest
         const tryOrder = [
           preferredClient,
           ...orderedClients().filter((c) => c !== preferredClient),
-        ];
+        ].slice(0, 4); // never try more than 4 clients for download
 
         let lastErr: Error | null = null;
         let succeeded = false;
 
         for (const client of tryOrder) {
-          // Clean partial files from previous attempt
           try {
             for (const f of fs.readdirSync(TEMP_DIR)) {
               if (f.startsWith(jobId)) fs.unlinkSync(path.join(TEMP_DIR, f));
@@ -470,7 +474,7 @@ app.post("/api/download", async (req, res) => {
           }
 
           args.push(url);
-          console.log(`yt-dlp client=${client}:`, args.join(" ").slice(0, 220));
+          console.log(`yt-dlp client=${client}`);
           job.message = `Downloading (${client})…`;
           job.client = client;
 
@@ -483,12 +487,14 @@ app.post("/api/download", async (req, res) => {
 
               let lastProgress = 12;
               let stderr = "";
+              let sawProgress = false;
 
               const onData = (d: Buffer) => {
                 const line = d.toString();
                 stderr += line;
                 const match = line.match(/(\d+\.?\d*)%/);
                 if (match) {
+                  sawProgress = true;
                   const p = Math.min(
                     92,
                     Math.round(parseFloat(match[1]) * 0.8) + 12
@@ -504,13 +510,22 @@ app.post("/api/download", async (req, res) => {
               proc.stdout.on("data", onData);
               proc.stderr.on("data", onData);
 
+              // Fail fast if no progress within 45s (bot wall / hanging)
+              const stallTimer = setTimeout(() => {
+                if (!sawProgress) {
+                  proc.kill("SIGKILL");
+                  reject(new Error("No progress — likely blocked or dead connection"));
+                }
+              }, 45_000);
+
               const timeout = setTimeout(() => {
                 proc.kill("SIGKILL");
                 reject(new Error("Download timed out"));
-              }, 10 * 60 * 1000);
+              }, 8 * 60 * 1000);
 
               proc.on("close", (code) => {
                 clearTimeout(timeout);
+                clearTimeout(stallTimer);
                 if (code === 0) resolve();
                 else {
                   const lines = stderr.split("\n").filter(Boolean);
@@ -524,6 +539,7 @@ app.post("/api/download", async (req, res) => {
 
               proc.on("error", (err) => {
                 clearTimeout(timeout);
+                clearTimeout(stallTimer);
                 reject(err);
               });
             });
@@ -536,9 +552,9 @@ app.post("/api/download", async (req, res) => {
           } catch (err: any) {
             lastErr = err;
             console.warn(`download client=${client} failed:`, err.message);
-            // only keep trying on bot/auth style failures
-            if (!isBotBlock(String(err.message || "")) && !/403|429|timeout/i.test(String(err.message || ""))) {
-              // still try next client for transient network
+            // On clear bot-block, stop trying more clients immediately
+            if (isBotBlock(String(err.message || ""))) {
+              break;
             }
           }
         }
@@ -629,5 +645,12 @@ app.listen(PORT, () => {
   console.log(`Temp dir: ${TEMP_DIR}`);
   console.log(`Clients: ${PLAYER_CLIENTS.join(", ")}`);
   console.log(`Concurrent fragments: ${CONCURRENT_FRAGMENTS}`);
-  console.log(`Proxy: ${PROXY_URL ? "yes" : "no"}`);
+  console.log(`Proxy configured: ${Boolean(PROXY_URL)}`);
+  if (PROXY_URL) {
+    try {
+      console.log(`Proxy host: ${new URL(PROXY_URL).host}`);
+    } catch {
+      console.log(`Proxy: set (invalid URL format?)`);
+    }
+  }
 });
