@@ -14,16 +14,44 @@ app.set("trust proxy", 1);
 
 const TEMP_DIR = process.env.TEMP_DIR || path.join(os.tmpdir(), "vidora");
 const MAX_DURATION_MIN = Number(process.env.MAX_DURATION_MIN || 30);
-const COOKIES_FILE = process.env.YTDLP_COOKIES_FILE || "";
 const PROXY_URL = (process.env.YTDLP_PROXY || process.env.HTTPS_PROXY || process.env.HTTP_PROXY || "").trim();
 const CONCURRENT_FRAGMENTS = Math.max(1, Math.min(16, Number(process.env.YTDLP_CONCURRENT_FRAGMENTS || 8)));
 const MAX_PARALLEL_CLIENTS = 3;
 const BGUTIL_POT_URL = (process.env.BGUTIL_POT_URL || "http://127.0.0.1:4416").trim();
 
-// Prefer clients that benefit from PO tokens + historically work on cloud IPs
+// Resolve cookies: file path OR paste Netscape cookies into YTDLP_COOKIES env
+const COOKIES_PATH = path.join(TEMP_DIR, "cookies.txt");
+function resolveCookiesFile(): string {
+  const fromFile = (process.env.YTDLP_COOKIES_FILE || "").trim();
+  if (fromFile && fs.existsSync(fromFile)) return fromFile;
+
+  const raw = (process.env.YTDLP_COOKIES || "").trim();
+  if (!raw) return "";
+
+  // Accept both real newlines and \n escaped strings from Render env UI
+  const content = raw.includes("\n") ? raw : raw.replace(/\\n/g, "\n");
+  if (!content.includes("youtube") && !content.includes(".youtube.com")) {
+    console.warn("[vidora] YTDLP_COOKIES set but doesn't look like YouTube cookies");
+  }
+  try {
+    if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
+    fs.writeFileSync(COOKIES_PATH, content.endsWith("\n") ? content : content + "\n", "utf8");
+    return COOKIES_PATH;
+  } catch (e) {
+    console.error("[vidora] failed to write cookies file", e);
+    return "";
+  }
+}
+
+const COOKIES_FILE = resolveCookiesFile();
+const HAS_COOKIES = Boolean(COOKIES_FILE);
+
+// With cookies, prefer clients that honor them. Without, lean on tv/android.
 const PLAYER_CLIENTS = (
   process.env.YTDLP_PLAYER_CLIENTS ||
-  "tv,mweb,web_embedded,android,web"
+  (HAS_COOKIES
+    ? "tv,web,mweb,web_embedded,android"
+    : "tv,mweb,web_embedded,android,web")
 )
   .split(",")
   .map((c) => c.trim())
@@ -130,14 +158,13 @@ function proxyArgs(): string[] {
   return [];
 }
 
-/** Base yt-dlp args including POT provider + client */
 function baseYtArgs(client: string): string[] {
+  // With cookies, don't skip webpage (helps auth). Without, skip for speed.
+  const skip = HAS_COOKIES ? "" : ";player_skip=webpage";
   const extractorParts = [
-    `youtube:player_client=${client}`,
-    "player_skip=webpage",
+    `youtube:player_client=${client}${skip}`,
   ];
 
-  // Tell the bgutil HTTP plugin where the POT server lives (default works, but explicit is safer)
   if (BGUTIL_POT_URL) {
     extractorParts.push(`youtubepot-bgutilhttp:base_url=${BGUTIL_POT_URL}`);
   }
@@ -169,7 +196,7 @@ function videoFormatForQuality(quality: string): string {
 }
 
 function isBotBlock(msg: string): boolean {
-  return /Sign in to confirm|not a bot|bot check|PO Token|confirm you.re not|HTTP Error 403|blocked/i.test(
+  return /Sign in to confirm|not a bot|bot check|PO Token|confirm you.re not|HTTP Error 403|blocked|LOGIN_REQUIRED/i.test(
     msg
   );
 }
@@ -260,7 +287,7 @@ async function runYtDlpWithFallback(
               errors.push(e);
               console.warn(
                 `yt-dlp client=${client} failed:`,
-                String(e.message || e).slice(0, 120)
+                String(e.message || e).slice(0, 140)
               );
             }
           }
@@ -278,7 +305,7 @@ async function runYtDlpWithFallback(
         .catch((e: any) => {
           console.warn(
             `yt-dlp client=${client} failed:`,
-            String(e.message || e).slice(0, 120)
+            String(e.message || e).slice(0, 140)
           );
           finish(null, e);
         });
@@ -331,7 +358,6 @@ function contentTypeForExt(ext: string): string {
   return map[ext.toLowerCase()] || "application/octet-stream";
 }
 
-/** User-facing errors only */
 function friendlyError(raw: string): string {
   const msg = String(raw || "").replace(/^ERROR:\s*/i, "");
 
@@ -358,6 +384,7 @@ app.get("/health", (_req, res) => {
     lastGoodClient,
     concurrentFragments: CONCURRENT_FRAGMENTS,
     potProvider: BGUTIL_POT_URL,
+    cookiesConfigured: HAS_COOKIES,
     proxyConfigured: Boolean(PROXY_URL),
   });
 });
@@ -662,5 +689,6 @@ app.listen(PORT, () => {
   console.log(`Vidora backend listening on :${PORT}`);
   console.log(`Clients: ${PLAYER_CLIENTS.join(", ")}`);
   console.log(`POT provider: ${BGUTIL_POT_URL}`);
+  console.log(`Cookies: ${HAS_COOKIES ? "yes" : "NO — most videos will fail on cloud IPs"}`);
   console.log(`Proxy: ${PROXY_URL ? "yes" : "no"}`);
 });
