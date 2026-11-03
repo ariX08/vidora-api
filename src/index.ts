@@ -18,12 +18,12 @@ const COOKIES_FILE = process.env.YTDLP_COOKIES_FILE || "";
 const PROXY_URL = (process.env.YTDLP_PROXY || process.env.HTTPS_PROXY || process.env.HTTP_PROXY || "").trim();
 const CONCURRENT_FRAGMENTS = Math.max(1, Math.min(16, Number(process.env.YTDLP_CONCURRENT_FRAGMENTS || 8)));
 const MAX_PARALLEL_CLIENTS = 3;
+const BGUTIL_POT_URL = (process.env.BGUTIL_POT_URL || "http://127.0.0.1:4416").trim();
 
-// Clients that historically work better on datacenter IPs without PO tokens / proxy.
-// Order matters: first success wins.
+// Prefer clients that benefit from PO tokens + historically work on cloud IPs
 const PLAYER_CLIENTS = (
   process.env.YTDLP_PLAYER_CLIENTS ||
-  "tv,tv_samsung,android_vr,web_embedded,android,mweb"
+  "tv,mweb,web_embedded,android,web"
 )
   .split(",")
   .map((c) => c.trim())
@@ -130,17 +130,28 @@ function proxyArgs(): string[] {
   return [];
 }
 
+/** Base yt-dlp args including POT provider + client */
 function baseYtArgs(client: string): string[] {
+  const extractorParts = [
+    `youtube:player_client=${client}`,
+    "player_skip=webpage",
+  ];
+
+  // Tell the bgutil HTTP plugin where the POT server lives (default works, but explicit is safer)
+  if (BGUTIL_POT_URL) {
+    extractorParts.push(`youtubepot-bgutilhttp:base_url=${BGUTIL_POT_URL}`);
+  }
+
   return [
     "--no-playlist",
     "--no-warnings",
     "--force-ipv4",
-    "--socket-timeout", "12",
+    "--socket-timeout", "15",
     "--retries", "2",
     "--fragment-retries", "3",
     "--concurrent-fragments", String(CONCURRENT_FRAGMENTS),
     "--extractor-args",
-    `youtube:player_client=${client};player_skip=webpage`,
+    extractorParts.join(";"),
     ...cookieArgs(),
     ...proxyArgs(),
   ];
@@ -165,7 +176,7 @@ function isBotBlock(msg: string): boolean {
 
 function runYtDlp(
   args: string[],
-  timeoutMs = 22_000
+  timeoutMs = 30_000
 ): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     const proc = spawn("yt-dlp", args, {
@@ -205,10 +216,9 @@ function runYtDlp(
   });
 }
 
-/** Race clients in parallel. First success wins. */
 async function runYtDlpWithFallback(
   buildArgs: (client: string) => string[],
-  timeoutMs = 20_000
+  timeoutMs = 25_000
 ): Promise<{ stdout: string; stderr: string; client: string }> {
   const clients = orderedClients();
   if (clients.length === 0) throw new Error("No player clients configured");
@@ -321,7 +331,7 @@ function contentTypeForExt(ext: string): string {
   return map[ext.toLowerCase()] || "application/octet-stream";
 }
 
-/** User-facing errors only — no technical / admin language */
+/** User-facing errors only */
 function friendlyError(raw: string): string {
   const msg = String(raw || "").replace(/^ERROR:\s*/i, "");
 
@@ -337,7 +347,6 @@ function friendlyError(raw: string): string {
   if (/Unsupported URL|Only YouTube/i.test(msg)) {
     return "Please enter a valid YouTube link.";
   }
-  // Generic fallback for end users
   return "Something went wrong while processing this video. Please try again.";
 }
 
@@ -348,6 +357,7 @@ app.get("/health", (_req, res) => {
     clients: orderedClients(),
     lastGoodClient,
     concurrentFragments: CONCURRENT_FRAGMENTS,
+    potProvider: BGUTIL_POT_URL,
     proxyConfigured: Boolean(PROXY_URL),
   });
 });
@@ -358,7 +368,7 @@ app.post("/api/info", async (req, res) => {
 
     const { stdout, client } = await runYtDlpWithFallback(
       (c) => ["--dump-json", "--no-download", ...baseYtArgs(c), url],
-      18_000
+      28_000
     );
 
     const meta = JSON.parse(stdout);
@@ -433,7 +443,7 @@ app.post("/api/download", async (req, res) => {
               ...baseYtArgs(c),
               url,
             ],
-            16_000
+            25_000
           );
           const t = metaOut.trim().split("\n")[0];
           if (t) videoTitle = t;
@@ -527,12 +537,12 @@ app.post("/api/download", async (req, res) => {
                   proc.kill("SIGKILL");
                   reject(new Error("No progress"));
                 }
-              }, 40_000);
+              }, 50_000);
 
               const timeout = setTimeout(() => {
                 proc.kill("SIGKILL");
                 reject(new Error("Download timed out"));
-              }, 8 * 60 * 1000);
+              }, 10 * 60 * 1000);
 
               proc.on("close", (code) => {
                 clearTimeout(timeout);
@@ -651,5 +661,6 @@ app.get("/api/file/:id", (req, res) => {
 app.listen(PORT, () => {
   console.log(`Vidora backend listening on :${PORT}`);
   console.log(`Clients: ${PLAYER_CLIENTS.join(", ")}`);
+  console.log(`POT provider: ${BGUTIL_POT_URL}`);
   console.log(`Proxy: ${PROXY_URL ? "yes" : "no"}`);
 });
