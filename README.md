@@ -58,3 +58,8 @@ BGUTIL_POT_URL=http://127.0.0.1:4416
 - PO tokens help a lot on flagged IPs but are **not a 100% guarantee**.
 - Extremely aggressive datacenter blocks may still need a residential proxy or cookies.
 - User-facing errors are soft. Real yt-dlp errors stay in the server logs.
+
+
+
+
+Can't make it work even with valid cookies.txt
